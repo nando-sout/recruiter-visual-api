@@ -46,6 +46,17 @@ public class Recruiter {
 	@Column(name = "verification_attempts", nullable = false)
 	private int verificationAttempts;
 
+	// Hash BCrypt do código de recuperação de senha ativo; NULL quando não há código ativo.
+	@Column(name = "password_reset_code_hash")
+	private String passwordResetCodeHash;
+
+	@Column(name = "password_reset_code_expires_at")
+	private LocalDateTime passwordResetCodeExpiresAt;
+
+	// Tentativas incorretas do código de recuperação ativo.
+	@Column(name = "password_reset_attempts", nullable = false)
+	private int passwordResetAttempts;
+
 	protected Recruiter() {
 	}
 
@@ -126,6 +137,30 @@ public class Recruiter {
 
 	public void setVerificationAttempts(int verificationAttempts) {
 		this.verificationAttempts = verificationAttempts;
+	}
+
+	public String getPasswordResetCodeHash() {
+		return passwordResetCodeHash;
+	}
+
+	public void setPasswordResetCodeHash(String passwordResetCodeHash) {
+		this.passwordResetCodeHash = passwordResetCodeHash;
+	}
+
+	public LocalDateTime getPasswordResetCodeExpiresAt() {
+		return passwordResetCodeExpiresAt;
+	}
+
+	public void setPasswordResetCodeExpiresAt(LocalDateTime passwordResetCodeExpiresAt) {
+		this.passwordResetCodeExpiresAt = passwordResetCodeExpiresAt;
+	}
+
+	public int getPasswordResetAttempts() {
+		return passwordResetAttempts;
+	}
+
+	public void setPasswordResetAttempts(int passwordResetAttempts) {
+		this.passwordResetAttempts = passwordResetAttempts;
 	}
 
 }

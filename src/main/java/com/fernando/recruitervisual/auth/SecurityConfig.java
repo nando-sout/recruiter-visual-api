@@ -35,7 +35,8 @@ public class SecurityConfig {
 				.authorizeHttpRequests(auth -> auth
 						.dispatcherTypeMatchers(DispatcherType.ERROR).permitAll()
 						.requestMatchers(HttpMethod.POST,
-								"/auth/login", "/auth/register", "/auth/verify-email", "/auth/resend-verification")
+								"/auth/login", "/auth/register", "/auth/verify-email", "/auth/resend-verification",
+								"/auth/forgot-password", "/auth/reset-password")
 						.permitAll()
 						.anyRequest().authenticated())
 				.exceptionHandling(ex -> ex.authenticationEntryPoint(new HttpStatusEntryPoint(HttpStatus.UNAUTHORIZED)))

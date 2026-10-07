@@ -52,6 +52,16 @@ public class AuthController {
 		return authService.resendVerification(request);
 	}
 
+	@PostMapping("/forgot-password")
+	public MessageResponse forgotPassword(@Valid @RequestBody ForgotPasswordRequest request) {
+		return authService.forgotPassword(request);
+	}
+
+	@PostMapping("/reset-password")
+	public MessageResponse resetPassword(@Valid @RequestBody ResetPasswordRequest request) {
+		return authService.resetPassword(request);
+	}
+
 	@ExceptionHandler(MethodArgumentNotValidException.class)
 	public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
 		Map<String, String> errors = new LinkedHashMap<>();
@@ -65,7 +75,7 @@ public class AuthController {
 	@ExceptionHandler(PasswordTooLongException.class)
 	public ResponseEntity<Map<String, Object>> handlePasswordTooLong(PasswordTooLongException ex) {
 		return ResponseEntity.badRequest()
-				.body(Map.of("message", "Dados inválidos", "errors", Map.of("password", ex.getMessage())));
+				.body(Map.of("message", "Dados inválidos", "errors", Map.of(ex.getField(), ex.getMessage())));
 	}
 
 	@ExceptionHandler(InvalidCredentialsException.class)

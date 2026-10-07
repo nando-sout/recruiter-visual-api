@@ -90,6 +90,41 @@ O JWT representa a identidade autenticada: ele identifica o recruiter. O token *
 
 O frontend guarda o token e o envia em todas as chamadas autenticadas, no cabeçalho `Authorization: Bearer <token>`.
 
+### Recuperação de senha
+
+```text
+POST /auth/forgot-password
+        ↓
+código de 6 dígitos enviado por e-mail
+        ↓
+POST /auth/reset-password (e-mail, código e nova senha)
+        ↓
+senha alterada → login com a nova senha
+```
+
+1. O recruiter informa o **e-mail** em `POST /auth/forgot-password`.
+2. Se o e-mail estiver cadastrado, um **código de recuperação de 6 dígitos** é enviado para ele. O código vale por **15 minutos** e é guardado apenas como hash.
+3. O recruiter informa **e-mail, código e nova senha** em `POST /auth/reset-password`. O código é conferido nessa mesma chamada: não há uma etapa separada só para validá-lo.
+4. Com o código correto, a nova senha é armazenada como hash **BCrypt** e o código deixa de valer, na mesma operação.
+5. O login passa a aceitar somente a nova senha.
+
+A resposta de `POST /auth/forgot-password` é **sempre a mesma mensagem**, com `200`: e-mail inexistente, pedido repetido antes do intervalo mínimo e falha no envio do e-mail não mudam a resposta. Assim a API não revela quais e-mails estão cadastrados. Uma falha de envio fica registrada no log do servidor, e o código que não foi entregue é descartado.
+
+- **Intervalo entre pedidos.** O mesmo e-mail gera um novo código no máximo **uma vez a cada 60 segundos**. Um pedido feito antes disso não gera código nem envia e-mail, e o código atual continua valendo.
+- **Novo código.** Passado o intervalo, um novo pedido gera outro código, que substitui o anterior.
+- **Tentativas.** Depois de **5 tentativas incorretas**, o código é invalidado e é preciso pedir outro, respeitando o intervalo de 60 segundos.
+- **Nova senha.** Segue a regra do cadastro: de 8 a 72 caracteres e no máximo 72 bytes. Uma senha recusada não conta como tentativa.
+- **Conta não verificada.** Também pode recuperar a senha. A troca **não verifica o e-mail**: o login continua respondendo `403` até a verificação da seção 2. O código de recuperação e o de verificação são independentes, e um não serve no lugar do outro.
+- **Tokens já emitidos.** A troca de senha não invalida tokens: os que já existem continuam válidos até expirar.
+
+| Situação | Resposta |
+|---|---|
+| Pedido de recuperação, qualquer que seja o e-mail | `200` com a mensagem genérica |
+| Código incorreto, expirado, já utilizado, invalidado ou e-mail sem pedido de recuperação | `400` — "Código inválido ou expirado" |
+| Código fora do formato ou nova senha inválida | `400` com o campo e a mensagem |
+
+**Ambiente local.** O e-mail de recuperação também é entregue ao Mailpit (`http://localhost:8025`).
+
 ## 4. Isolamento entre recruiters
 
 ```text

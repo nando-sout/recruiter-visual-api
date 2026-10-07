@@ -37,9 +37,9 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultActions;
 
 /**
- * Testes de integração de POST /auth/register, /auth/verify-email, /auth/resend-verification e /auth/login
- * contra o PostgreSQL real. Nenhum e-mail é enviado: o VerificationEmailSender é um mock, que também
- * expõe o código gerado.
+ * Testes de integração de POST /auth/register, /auth/verify-email, /auth/resend-verification, /auth/login,
+ * /auth/forgot-password e /auth/reset-password contra o PostgreSQL real. Nenhum e-mail é enviado: o
+ * VerificationEmailSender é um mock, que também expõe o código gerado.
  * Cada teste usa e-mails com um sufixo próprio e remove os recruiters que criou ao final.
  */
 @SpringBootTest
@@ -51,6 +51,9 @@ class AuthControllerTests {
 	private static final String INVALID_CODE_MESSAGE = "Código inválido ou expirado";
 	private static final String RESEND_MESSAGE =
 			"Se o e-mail estiver cadastrado e ainda não verificado, enviaremos um novo código de verificação.";
+	private static final String NEW_PASSWORD = "nova-senha-segura-456";
+	private static final String FORGOT_PASSWORD_MESSAGE =
+			"Se o e-mail estiver cadastrado, enviaremos um código para a recuperação de senha.";
 	private static final Duration VALIDITY = Duration.ofMinutes(15);
 
 	@Autowired
@@ -588,6 +591,367 @@ class AuthControllerTests {
 				.andExpect(jsonPath("$.token").isNotEmpty());
 	}
 
+	// ---------- POST /auth/forgot-password ----------
+
+	@Test
+	void forgotPasswordSendsSixDigitCodeByEmail() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+
+		forgotPassword(email)
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.message").value(FORGOT_PASSWORD_MESSAGE))
+				.andExpect(jsonPath("$.code").doesNotExist());
+
+		verify(verificationEmailSender, times(1)).sendPasswordResetCode(eq(email), anyString(), eq(VALIDITY));
+		assertThat(lastSentResetCode(email, 1)).matches("\\d{6}");
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+	}
+
+	@Test
+	void forgotPasswordStoresOnlyBcryptHashOfCode() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		String codeHash = column(email, "password_reset_code_hash", String.class);
+		assertThat(codeHash).isNotEqualTo(code).doesNotContain(code).startsWith("$2");
+		assertThat(passwordEncoder.matches(code, codeHash)).isTrue();
+	}
+
+	@Test
+	void resetCodeExpiresInFifteenMinutes() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+
+		LocalDateTime before = LocalDateTime.now();
+		forgotPassword(email).andExpect(status().isOk());
+		LocalDateTime after = LocalDateTime.now();
+
+		LocalDateTime expiresAt = column(email, "password_reset_code_expires_at", LocalDateTime.class);
+		// Margem de 1s para o arredondamento do TIMESTAMP do banco.
+		assertThat(expiresAt).isBetween(before.plus(VALIDITY).minusSeconds(1), after.plus(VALIDITY).plusSeconds(1));
+	}
+
+	@Test
+	void forgotPasswordAcceptsEmailWithDifferentCaseAndSpaces() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+
+		forgotPassword("  " + email.toUpperCase() + "  ").andExpect(status().isOk());
+
+		verify(verificationEmailSender, times(1)).sendPasswordResetCode(eq(email), anyString(), eq(VALIDITY));
+	}
+
+	@Test
+	void forgotPasswordForUnknownEmailGetsSameResponseAndSendsNothing() throws Exception {
+		forgotPassword(email("inexistente"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.message").value(FORGOT_PASSWORD_MESSAGE));
+
+		verify(verificationEmailSender, never()).sendPasswordResetCode(anyString(), anyString(), any());
+	}
+
+	@Test
+	void forgotPasswordWithinCooldownKeepsCurrentCodeAndSendsNothing() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+		String hash = column(email, "password_reset_code_hash", String.class);
+		LocalDateTime expiresAt = column(email, "password_reset_code_expires_at", LocalDateTime.class);
+
+		// Segundo pedido dentro dos 60 segundos: mesma resposta, nenhum código novo.
+		forgotPassword(email)
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.message").value(FORGOT_PASSWORD_MESSAGE));
+
+		verify(verificationEmailSender, times(1)).sendPasswordResetCode(eq(email), anyString(), any());
+		assertThat(column(email, "password_reset_code_hash", String.class)).isEqualTo(hash);
+		assertThat(column(email, "password_reset_code_expires_at", LocalDateTime.class)).isEqualTo(expiresAt);
+		resetPassword(email, code, NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
+	void forgotPasswordAfterCooldownGeneratesNewCodeAndInvalidatesPrevious() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String firstCode = requestResetCode(email);
+		String firstHash = column(email, "password_reset_code_hash", String.class);
+		resetPassword(email, wrongCode(firstCode), NEW_PASSWORD).andExpect(status().isBadRequest());
+		passResetCooldown(email);
+
+		forgotPassword(email).andExpect(status().isOk());
+
+		String secondCode = lastSentResetCode(email, 2);
+		String secondHash = column(email, "password_reset_code_hash", String.class);
+		assertThat(secondHash).isNotEqualTo(firstHash);
+		assertThat(passwordEncoder.matches(secondCode, secondHash)).isTrue();
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+
+		if (!firstCode.equals(secondCode)) {
+			resetPassword(email, firstCode, NEW_PASSWORD).andExpect(status().isBadRequest());
+		}
+		resetPassword(email, secondCode, NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
+	void cooldownStillAppliesAfterCodeIsInvalidatedByWrongAttempts() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+		for (int i = 1; i <= 5; i++) {
+			resetPassword(email, wrongCode(code), NEW_PASSWORD).andExpect(status().isBadRequest());
+		}
+
+		// Esgotar as tentativas não libera um código novo antes dos 60 segundos.
+		forgotPassword(email).andExpect(status().isOk());
+		verify(verificationEmailSender, times(1)).sendPasswordResetCode(eq(email), anyString(), any());
+		assertThat(column(email, "password_reset_code_hash", String.class)).isNull();
+
+		passResetCooldown(email);
+		forgotPassword(email).andExpect(status().isOk());
+		resetPassword(email, lastSentResetCode(email, 2), NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
+	void forgotPasswordDoesNotRevealEmailFailure() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		doThrow(new MailSendException("SMTP indisponível"))
+				.doNothing()
+				.when(verificationEmailSender).sendPasswordResetCode(anyString(), anyString(), any());
+
+		// Mesma resposta de um e-mail inexistente, sem 503 e sem detalhe do erro.
+		forgotPassword(email)
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.message").value(FORGOT_PASSWORD_MESSAGE))
+				.andExpect(jsonPath("$.length()").value(1));
+
+		// O código que não foi entregue é descartado.
+		assertThat(column(email, "password_reset_code_hash", String.class)).isNull();
+		assertThat(column(email, "password_reset_code_expires_at", LocalDateTime.class)).isNull();
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+
+		// E um novo pedido não fica preso no cooldown.
+		forgotPassword(email).andExpect(status().isOk());
+		resetPassword(email, lastSentResetCode(email, 2), NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
+	void forgotPasswordRejectsMissingAndInvalidEmail() throws Exception {
+		mockMvc.perform(post("/auth/forgot-password").contentType(MediaType.APPLICATION_JSON).content("{}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.errors.email").value("é obrigatório"));
+		forgotPassword("nao-e-email")
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.errors.email").value("deve ser um e-mail válido"));
+	}
+
+	// ---------- POST /auth/reset-password ----------
+
+	@Test
+	void correctCodeChangesPassword() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		resetPassword(email, code, NEW_PASSWORD)
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.message").value("Senha alterada com sucesso. Você já pode fazer login com a nova senha."))
+				.andExpect(jsonPath("$.token").doesNotExist());
+
+		String hash = column(email, "password_hash", String.class);
+		assertThat(hash).isNotEqualTo(NEW_PASSWORD).startsWith("$2");
+		assertThat(passwordEncoder.matches(NEW_PASSWORD, hash)).isTrue();
+		assertThat(column(email, "password_reset_code_hash", String.class)).isNull();
+		assertThat(column(email, "password_reset_code_expires_at", LocalDateTime.class)).isNull();
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+
+		// A senha antiga deixa de funcionar; a nova entra.
+		login(email, PASSWORD)
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value("E-mail ou senha inválidos"));
+		login(email, NEW_PASSWORD)
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.token").isNotEmpty());
+	}
+
+	@Test
+	void resetAcceptsEmailWithDifferentCaseAndSpaces() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		resetPassword("  " + email.toUpperCase() + "  ", code, NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
+	void resetCodeCannotBeReused() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+		resetPassword(email, code, NEW_PASSWORD).andExpect(status().isOk());
+
+		resetPassword(email, code, "outra-senha-456")
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+
+		assertThat(passwordEncoder.matches(NEW_PASSWORD, column(email, "password_hash", String.class))).isTrue();
+	}
+
+	@Test
+	void wrongResetCodeIncrementsAttempts() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		resetPassword(email, wrongCode(code), NEW_PASSWORD)
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isEqualTo(1);
+
+		resetPassword(email, wrongCode(code), NEW_PASSWORD).andExpect(status().isBadRequest());
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isEqualTo(2);
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+	}
+
+	@Test
+	void fifthWrongResetCodeInvalidatesCode() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		for (int i = 1; i <= 4; i++) {
+			resetPassword(email, wrongCode(code), NEW_PASSWORD).andExpect(status().isBadRequest());
+		}
+		assertThat(column(email, "password_reset_code_hash", String.class)).isNotNull();
+
+		resetPassword(email, wrongCode(code), NEW_PASSWORD)
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isEqualTo(5);
+		assertThat(column(email, "password_reset_code_hash", String.class)).isNull();
+
+		// Nem o código correto vale mais, e a senha continua a mesma.
+		resetPassword(email, code, NEW_PASSWORD)
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+	}
+
+	@Test
+	void expiredResetCodeIsRejected() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+		jdbcTemplate.update("UPDATE recruiter SET password_reset_code_expires_at = ? WHERE email = ?",
+				LocalDateTime.now().minusMinutes(1), email);
+
+		resetPassword(email, code, NEW_PASSWORD)
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+	}
+
+	@Test
+	void resetWithoutRequestedCodeGetsSameGenericMessage() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+
+		// Conta existente que nunca pediu recuperação.
+		resetPassword(email, "123456", NEW_PASSWORD)
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+
+		// E-mail não cadastrado.
+		resetPassword(email("inexistente"), "123456", NEW_PASSWORD)
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value(INVALID_CODE_MESSAGE));
+	}
+
+	@Test
+	void resetRejectsInvalidPasswordAndCodeFormat() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		for (String password : List.of("1234567", "a".repeat(73))) {
+			resetPassword(email, code, password)
+					.andExpect(status().isBadRequest())
+					.andExpect(jsonPath("$.message").value("Dados inválidos"))
+					.andExpect(jsonPath("$.errors.newPassword").value("deve ter entre 8 e 72 caracteres"));
+		}
+		for (String invalidCode : List.of("12345", "1234567", "12a456", " 123456")) {
+			resetPassword(email, invalidCode, NEW_PASSWORD)
+					.andExpect(status().isBadRequest())
+					.andExpect(jsonPath("$.errors.code").value("deve ter exatamente 6 dígitos"));
+		}
+		mockMvc.perform(post("/auth/reset-password").contentType(MediaType.APPLICATION_JSON).content("{}"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.errors.email").value("é obrigatório"))
+				.andExpect(jsonPath("$.errors.code").value("é obrigatório"))
+				.andExpect(jsonPath("$.errors.newPassword").value("é obrigatório"));
+
+		// Dados inválidos não contam como tentativa nem trocam a senha; o código continua valendo.
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+		resetPassword(email, code, "a".repeat(72)).andExpect(status().isOk());
+	}
+
+	@Test
+	void resetRejectsPasswordOverSeventyTwoBytesEvenWithinSeventyTwoCharacters() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+		String code = requestResetCode(email);
+
+		// 37 caracteres, 74 bytes em UTF-8: o BCrypt não aceitaria.
+		resetPassword(email, code, "é".repeat(37))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value("Dados inválidos"))
+				.andExpect(jsonPath("$.errors.newPassword").value("deve ter no máximo 72 bytes"));
+
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+		assertThat(column(email, "password_reset_code_hash", String.class)).isNotNull();
+		assertThat(passwordEncoder.matches(PASSWORD, column(email, "password_hash", String.class))).isTrue();
+	}
+
+	@Test
+	void unverifiedAccountCanResetPasswordButStaysUnverified() throws Exception {
+		String email = email("ana");
+		String verificationCode = registerAndGetCode(email);
+		String verificationHash = column(email, "verification_code_hash", String.class);
+
+		String resetCode = requestResetCode(email);
+		resetPassword(email, resetCode, NEW_PASSWORD).andExpect(status().isOk());
+
+		assertThat(passwordEncoder.matches(NEW_PASSWORD, column(email, "password_hash", String.class))).isTrue();
+		assertThat(column(email, "email_verified_at", LocalDateTime.class)).isNull();
+		assertThat(column(email, "verification_code_hash", String.class)).isEqualTo(verificationHash);
+
+		// O login com a nova senha continua exigindo a verificação do e-mail.
+		login(email, NEW_PASSWORD).andExpect(status().isForbidden());
+		verifyEmail(email, verificationCode).andExpect(status().isOk());
+		login(email, NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
+	void resetCodeDoesNotVerifyEmail() throws Exception {
+		String email = email("ana");
+		String verificationCode = registerAndGetCode(email);
+		String resetCode = requestResetCode(email);
+
+		// Os dois códigos são independentes: o de recuperação não serve em /auth/verify-email.
+		if (!resetCode.equals(verificationCode)) {
+			verifyEmail(email, resetCode).andExpect(status().isBadRequest());
+			assertThat(column(email, "email_verified_at", LocalDateTime.class)).isNull();
+		}
+		assertThat(column(email, "password_reset_attempts", Integer.class)).isZero();
+	}
+
 	// ---------- Segurança ----------
 
 	@Test
@@ -601,11 +965,23 @@ class AuthControllerTests {
 	}
 
 	@Test
+	void forgotAndResetPasswordArePublic() throws Exception {
+		String email = email("ana");
+		registerAndVerify(email);
+
+		// Nenhuma das chamadas envia Authorization.
+		forgotPassword(email).andExpect(status().isOk());
+		resetPassword(email, lastSentResetCode(email, 1), NEW_PASSWORD).andExpect(status().isOk());
+	}
+
+	@Test
 	void otherRoutesStayProtected() throws Exception {
 		mockMvc.perform(get("/vagas")).andExpect(status().isUnauthorized());
 		// Só o POST das rotas de auth é público.
 		mockMvc.perform(get("/auth/register")).andExpect(status().isUnauthorized());
 		mockMvc.perform(get("/auth/verify-email")).andExpect(status().isUnauthorized());
+		mockMvc.perform(get("/auth/forgot-password")).andExpect(status().isUnauthorized());
+		mockMvc.perform(get("/auth/reset-password")).andExpect(status().isUnauthorized());
 		mockMvc.perform(post("/auth/outra-rota").contentType(MediaType.APPLICATION_JSON).content("{}"))
 				.andExpect(status().isUnauthorized());
 		mockMvc.perform(post("/auth/register").contentType(MediaType.APPLICATION_JSON).content("{}"))
@@ -634,6 +1010,24 @@ class AuthControllerTests {
 		return code.getValue();
 	}
 
+	private String requestResetCode(String email) throws Exception {
+		forgotPassword(email).andExpect(status().isOk());
+		return lastSentResetCode(email, 1);
+	}
+
+	// Código do último e-mail de recuperação enviado para o endereço; confere também quantos foram enviados.
+	private String lastSentResetCode(String email, int expectedSends) {
+		ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
+		verify(verificationEmailSender, times(expectedSends)).sendPasswordResetCode(eq(email), code.capture(), eq(VALIDITY));
+		return code.getValue();
+	}
+
+	// Recua a geração do código atual para antes do cooldown de 60 segundos, como se o tempo tivesse passado.
+	private void passResetCooldown(String email) {
+		jdbcTemplate.update("UPDATE recruiter SET password_reset_code_expires_at = ? WHERE email = ?",
+				LocalDateTime.now().plus(VALIDITY).minusSeconds(61), email);
+	}
+
 	private static String wrongCode(String code) {
 		return code.equals("000000") ? "111111" : "000000";
 	}
@@ -648,6 +1042,14 @@ class AuthControllerTests {
 
 	private ResultActions resend(String email) throws Exception {
 		return postJson("/auth/resend-verification", Map.of("email", email));
+	}
+
+	private ResultActions forgotPassword(String email) throws Exception {
+		return postJson("/auth/forgot-password", Map.of("email", email));
+	}
+
+	private ResultActions resetPassword(String email, String code, String newPassword) throws Exception {
+		return postJson("/auth/reset-password", Map.of("email", email, "code", code, "newPassword", newPassword));
 	}
 
 	private ResultActions login(String email, String password) throws Exception {

@@ -8,6 +8,7 @@ O Recruiter Visual **não pretende ser um ATS completo**. Ele não publica vagas
 
 - **Cadastro e verificação de e-mail** — o recruiter se cadastra e confirma o e-mail com um código de 6 dígitos enviado por e-mail.
 - **Login com JWT** — só é liberado depois da verificação do e-mail.
+- **Recuperação de senha** — o recruiter recebe um código de 6 dígitos por e-mail e define uma nova senha.
 - **Isolamento por recruiter** — cada recruiter enxerga e altera somente as próprias vagas.
 - **Vagas** — criar, listar, consultar e editar título e descrição.
 - **Status da vaga** — `ATUANDO`, `PAUSADA`, `FECHADA` e `CANCELADA`, com transições controladas.
@@ -60,7 +61,8 @@ Os detalhes ficam em [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md).
 - A tentativa de acesso indevido recebe a mesma resposta de uma vaga inexistente: `404` com `{"message": "Vaga não encontrada"}`. Assim a API não revela que a vaga existe.
 - Requisições sem token, ou com token inválido ou expirado, recebem `401`.
 - O **login depende da verificação de e-mail**: com a senha correta e o e-mail ainda não verificado, a resposta é `403`.
-- As senhas são armazenadas com **BCrypt**. O código de verificação de e-mail também é guardado apenas como hash.
+- As senhas são armazenadas com **BCrypt**. Os códigos de verificação de e-mail e de recuperação de senha também são guardados apenas como hash.
+- A **recuperação de senha** responde sempre com a mesma mensagem, exista ou não o e-mail, e aceita um novo pedido por e-mail a cada 60 segundos. Trocar a senha não invalida os tokens já emitidos, que valem até expirar.
 - A API é stateless: não há sessão no servidor. Os únicos endpoints públicos são os de `/auth`.
 - O **CORS** aceita uma única origem, a definida em `FRONTEND_URL`. Não há autenticação por cookie, e `allowCredentials` não está habilitado.
 
@@ -74,7 +76,7 @@ Os detalhes ficam em [`docs/ARQUITETURA.md`](docs/ARQUITETURA.md).
 | Mailpit (SMTP) | `localhost:1025` | usado pelo backend para enviar e-mails |
 | Frontend | `http://localhost:5173` | origem aceita pelo CORS quando `FRONTEND_URL` não está definida |
 
-O **Mailpit** é usado para visualizar, durante o desenvolvimento, os e-mails de verificação: o código enviado no cadastro aparece na interface web em vez de ir para uma caixa de e-mail real.
+O **Mailpit** é usado para visualizar, durante o desenvolvimento, os e-mails de verificação e de recuperação de senha: o código enviado aparece na interface web em vez de ir para uma caixa de e-mail real.
 
 PostgreSQL e Mailpit precisam estar disponíveis nos endereços acima; no ambiente de desenvolvimento do projeto eles rodam em containers (imagens `postgres:16` e `axllent/mailpit`). O repositório não traz arquivos para subi-los: o único arquivo Docker é o `Dockerfile` da própria aplicação (veja [Docker](#docker)).
 
@@ -164,7 +166,7 @@ Dentro do container, `localhost` é o próprio container: os padrões locais de 
 
 O banco é versionado pelo **Flyway**. O schema nunca é gerado pelo Hibernate, que apenas o valida.
 
-Existem atualmente **9 migrations** (`V1` a `V9`), todas aplicadas, em `src/main/resources/db/migration`:
+Existem atualmente **10 migrations** (`V1` a `V10`), todas aplicadas, em `src/main/resources/db/migration`:
 
 | Versão | Conteúdo |
 |---|---|
@@ -177,6 +179,7 @@ Existem atualmente **9 migrations** (`V1` a `V9`), todas aplicadas, em `src/main
 | V7 | mudança de status da vaga no histórico |
 | V8 | verificação de e-mail do recruiter |
 | V9 | avaliação do candidato por etapa |
+| V10 | recuperação de senha do recruiter |
 
 ## Testes
 
@@ -196,7 +199,7 @@ Pacotes, em `src/main/java/com/fernando/recruitervisual`:
 
 | Pacote | Conteúdo |
 |---|---|
-| `auth` | cadastro, verificação de e-mail, login, JWT e configuração de segurança |
+| `auth` | cadastro, verificação de e-mail, login, recuperação de senha, JWT e configuração de segurança |
 | `recruiter` | entidade e repositório do recruiter |
 | `vaga` | vagas, etapas, candidatos, avaliações e histórico |
 
@@ -224,7 +227,7 @@ Os endpoints REST são organizados por domínio. As regras detalhadas de cada um
 
 | Grupo | Rotas | Autenticação |
 |---|---|---|
-| Autenticação | `/auth/register`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/login` | públicas |
+| Autenticação | `/auth/register`, `/auth/verify-email`, `/auth/resend-verification`, `/auth/login`, `/auth/forgot-password`, `/auth/reset-password` | públicas |
 | Vagas | `/vagas`, `/vagas/{id}` | JWT |
 | Status da vaga | `/vagas/{vagaId}/status` | JWT |
 | Etapas | `/vagas/{vagaId}/etapas` | JWT |
